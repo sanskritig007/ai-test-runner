@@ -9,10 +9,11 @@ class BrowserController:
     Acts as the 'eyes and hands' of the AI agent:
     - Extracts visible interactive elements from the DOM (Perception)
     - Executes actions like click, fill, assert (Action)
+    - Automatically handles new tabs / popup windows
     - Captures screenshots for auditing and test reporting
     """
 
-    def __init__(self, headless: bool = False, slow_mo: int = 400):
+    def __init__(self, headless: bool = False, slow_mo: int = 500):
         self.headless = headless
         self.slow_mo = slow_mo
         self.playwright: Optional[Playwright] = None
@@ -20,6 +21,15 @@ class BrowserController:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         os.makedirs("screenshots", exist_ok=True)
+
+    def _on_new_page(self, new_page: Page):
+        """Automatically tracks and switches to new tabs opened by links."""
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        self.page = new_page
+        print(f"  [Browser Navigation] Switched to new active tab: '{self.page.title()[:40]}'")
 
     def start(self):
         """Launches the Playwright Chromium browser."""
@@ -32,6 +42,8 @@ class BrowserController:
             viewport={"width": 1280, "height": 800},
             user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
+        # Handle links that open in new tabs (target="_blank")
+        self.context.on("page", self._on_new_page)
         self.page = self.context.new_page()
 
     def navigate(self, url: str):
@@ -39,12 +51,11 @@ class BrowserController:
         if not self.page:
             raise RuntimeError("Browser not started. Call start() first.")
         
-        # Ensure proper URL scheme
         if not url.startswith("http://") and not url.startswith("https://") and not url.startswith("file://"):
             url = f"https://{url}"
 
         self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(1.5)  # Allow initial dynamic scripts to settle
+        time.sleep(1.5)
 
     def get_interactive_elements(self) -> List[Dict[str, Any]]:
         """
@@ -66,7 +77,6 @@ class BrowserController:
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
 
-                // Filter out invisible or hidden elements
                 if (rect.width === 0 || rect.height === 0 || style.visibility === 'hidden' || style.display === 'none') {
                     continue;
                 }
@@ -78,10 +88,7 @@ class BrowserController:
                 const ariaLabel = el.getAttribute('aria-label') || '';
                 const name = el.getAttribute('name') || '';
                 const id = el.getAttribute('id') || '';
-                const href = el.getAttribute('href') || '';
-                const value = el.value || '';
 
-                // Build a reliable Playwright selector
                 let selector = '';
                 if (id) {
                     selector = `#${id}`;
@@ -110,12 +117,15 @@ class BrowserController:
                 });
 
                 idx++;
-                if (idx >= 60) break; // Limit context size for fast AI processing
+                if (idx >= 60) break;
             }
             return elements;
         }
         """
-        return self.page.evaluate(js_script)
+        try:
+            return self.page.evaluate(js_script)
+        except Exception:
+            return []
 
     def execute_action(self, action: str, selector: str, value: Optional[str] = None) -> bool:
         """
@@ -134,7 +144,6 @@ class BrowserController:
                 try:
                     loc.click(timeout=4000)
                 except Exception:
-                    # Fallback to force JS click if intercepted
                     loc.evaluate("el => el.click()")
                 time.sleep(1.5)
                 return True
@@ -179,7 +188,6 @@ class BrowserController:
             if condition_text.lower() in content:
                 return True
 
-            # Also check text across visible headings and alerts
             visible_texts = self.page.locator("h1, h2, h3, h4, .dashboard, [role='alert'], .alert").all_inner_texts()
             for t in visible_texts:
                 if condition_text.lower() in t.lower():
@@ -211,4 +219,3 @@ class BrowserController:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
-

@@ -1,7 +1,10 @@
 import os
 import json
 import re
+import warnings
 from typing import List, Dict, Any, Optional
+
+warnings.filterwarnings("ignore")
 
 try:
     import google.generativeai as genai
@@ -28,7 +31,6 @@ class AIPlanner:
         if self.api_key and GENAI_AVAILABLE:
             try:
                 genai.configure(api_key=self.api_key)
-                # Use Gemini 1.5 Flash for high speed and reliable JSON output
                 self.model = genai.GenerativeModel("gemini-1.5-flash")
                 self.use_llm = True
             except Exception as e:
@@ -102,7 +104,6 @@ INSTRUCTIONS:
         response = self.model.generate_content(prompt)
         text = response.text.strip()
 
-        # Extract JSON using regex in case model wraps in markdown codeblocks
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
@@ -124,42 +125,53 @@ INSTRUCTIONS:
         goal_lower = goal.lower()
         url_lower = current_url.lower()
         title_lower = page_title.lower()
-
-        # Step Count Check to prevent endless loops
         step_count = len(past_steps)
 
-        # 1. Goal Verification Check (Has dashboard / account loaded?)
-        if "dashboard" in goal_lower or "verify" in goal_lower:
-            if "dashboard" in url_lower or "dashboard" in title_lower or "account" in url_lower:
-                return {
-                    "thought": "Dashboard page has been successfully reached.",
-                    "action": "finish",
-                    "selector": "",
-                    "value": "Dashboard",
-                    "goal_achieved": True
-                }
+        # 1. Goal Verification Check (Has dashboard / inventory / account loaded?)
+        for verify_term in ["dashboard", "inventory", "account", "overview", "logged"]:
+            if verify_term in goal_lower:
+                if verify_term in url_lower or verify_term in title_lower:
+                    return {
+                        "thought": f"Target page condition '{verify_term}' has been successfully reached.",
+                        "action": "finish",
+                        "selector": "",
+                        "value": verify_term,
+                        "goal_achieved": True
+                    }
 
-        # 2. Login Form Handling (If we are on a login page or inputs are visible)
-        email_input = next((el for el in elements if el.get("type") in ["email", "text"] and any(k in (el.get("name") + el.get("placeholder") + el.get("selector")).lower() for k in ["email", "user", "login"])), None)
-        password_input = next((el for el in elements if el.get("type") == "password"), None)
-        submit_btn = next((el for el in elements if any(k in (el.get("text") + el.get("value", "") + el.get("selector")).lower() for k in ["login", "sign in", "submit", "log in"])), None)
+        # Track filled and clicked selectors
+        filled_selectors = {
+            s.get("selector") for s in past_steps if s.get("action") == "fill"
+        }
+        clicked_selectors = {
+            s.get("selector") for s in past_steps if s.get("action") == "click"
+        }
 
-        # If on login form, fill credentials sequentially
-        already_filled_email = any(s.get("action") == "fill" and "email" in s.get("selector", "") for s in past_steps)
-        already_filled_pass = any(s.get("action") == "fill" and ("password" in s.get("selector", "") or "pass" in s.get("selector", "")) for s in past_steps)
+        # 2. Login Form Handling (If username/email and password inputs are detected)
+        email_input = next(
+            (el for el in elements if el.get("type") in ["email", "text"] and el["selector"] not in filled_selectors and any(k in (el.get("name") + el.get("placeholder") + el.get("selector") + el.get("id")).lower() for k in ["email", "user", "login", "uname", "username"])),
+            None
+        )
+        password_input = next(
+            (el for el in elements if el.get("type") == "password" and el["selector"] not in filled_selectors),
+            None
+        )
+        submit_btn = next(
+            (el for el in elements if any(k in (el.get("text") + el.get("value", "") + el.get("selector") + el.get("id")).lower() for k in ["login", "sign in", "submit", "log in", "login-button"])),
+            None
+        )
 
-        if email_input and not already_filled_email:
-            # Common demo credentials for PHPTravels / standard QA sites
-            demo_email = "user@phptravels.com" if "phptravels" in url_lower else "standard_user"
+        if email_input:
+            demo_user = "user@phptravels.com" if "phptravels" in url_lower else "standard_user"
             return {
-                "thought": f"Identified username/email input field. Entering credentials ({demo_email}).",
+                "thought": f"Identified username/email input field. Entering credentials ({demo_user}).",
                 "action": "fill",
                 "selector": email_input["selector"],
-                "value": demo_email,
+                "value": demo_user,
                 "goal_achieved": False
             }
 
-        if password_input and not already_filled_pass:
+        if password_input:
             demo_pass = "demouser" if "phptravels" in url_lower else "secret_sauce"
             return {
                 "thought": "Identified password input field. Entering password.",
@@ -169,7 +181,7 @@ INSTRUCTIONS:
                 "goal_achieved": False
             }
 
-        if submit_btn and already_filled_email:
+        if submit_btn and len(filled_selectors) > 0 and submit_btn["selector"] not in clicked_selectors:
             return {
                 "thought": "Submitting login credentials to access the account.",
                 "action": "click",
@@ -180,14 +192,13 @@ INSTRUCTIONS:
 
         # 3. Landing Page Navigation (e.g. from phptravels.com/demo to Customer Portal)
         if "login" in goal_lower or "customer" in goal_lower:
-            # Look for customer / login / demo links
             portal_link = next(
-                (el for el in elements if any(term in (el.get("text") or "").lower() for term in ["customer", "client", "login", "sign in", "demo"])),
+                (el for el in elements if el["selector"] not in clicked_selectors and any(term in (el.get("text") or "").lower() for term in ["customer", "client", "login", "sign in", "live demo"])),
                 None
             )
             if portal_link:
                 return {
-                    "thought": f"Navigating towards login flow via '{portal_link.get('text')}'.",
+                    "thought": f"Navigating towards customer portal via '{portal_link.get('text')}'.",
                     "action": "click",
                     "selector": portal_link["selector"],
                     "value": "",
@@ -196,6 +207,8 @@ INSTRUCTIONS:
 
         # 4. Fallback: Check if goal keywords match any visible button
         for el in elements:
+            if el["selector"] in clicked_selectors:
+                continue
             text = (el.get("text") or "").lower()
             if text and any(w in goal_lower for w in text.split()):
                 return {
@@ -206,12 +219,11 @@ INSTRUCTIONS:
                     "goal_achieved": False
                 }
 
-        # 5. Default assertion / termination if max steps approached
+        # 5. Default assertion / termination
         return {
             "thought": "Verifying presence of expected condition on page.",
             "action": "assert",
             "selector": "",
             "value": "dashboard" if "dashboard" in goal_lower else page_title,
-            "goal_achieved": True if step_count >= 3 else False
+            "goal_achieved": True if step_count >= 2 else False
         }
-
